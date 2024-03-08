@@ -19,10 +19,11 @@ const (
 
 // Backend holds the data about a server
 type Backend struct {
-	URL   *url.URL
-	Alive bool
-	// mux          sync.RWMutex
+	URL          *url.URL
+	Alive        bool
 	ReverseProxy *httputil.ReverseProxy
+	countConn    uint
+	// mux          sync.RWMutex
 }
 
 // SetAlive for this backend
@@ -67,19 +68,37 @@ func (s *ServerPool) NextIndex() uint64 {
 	return ((s.current + 1) % uint64(len(s.backends)))
 }
 
-// func GetNextPeer() *Backend {}
-
-func (s *ServerPool) GetNextPeer() *Backend {
-	next := serverPool.NextIndex()
+func (s *ServerPool) GetNextPeer(algorithm string) *Backend {
 	length := len(s.backends)
-	for i := next; i < uint64(length)+next; i++ {
-		indx := i % uint64(length)
-		if serverPool.backends[indx].IsAlive() {
-			serverPool.current = indx
-			fmt.Println("index: ", indx)
-			return s.backends[indx]
+	if algorithm == "roundrobin" {
+		next := serverPool.NextIndex()
+		for i := next; i < uint64(length)+next; i++ {
+			indx := i % uint64(length)
+			if serverPool.backends[indx].IsAlive() {
+				serverPool.current = indx
+				fmt.Println("index: ", indx)
+				return s.backends[indx]
+			}
 		}
+	} else if algorithm == "leastconn" {
+		var minLeastConnBackend uint = 0
+		var index uint = 0
+
+		for i := 0; i < length; i++ {
+			if s.backends[i].countConn > minLeastConnBackend {
+				minLeastConnBackend = s.backends[i].countConn
+			}
+		}
+		for i := 0; i < length; i++ {
+			if s.backends[i].countConn < minLeastConnBackend {
+				index = uint(i)
+				break
+			}
+		}
+		s.backends[index].IncreaseConn()
+		return s.backends[index]
 	}
+
 	return nil
 }
 
@@ -91,7 +110,27 @@ func RoundRobin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	peer := serverPool.GetNextPeer()
+	peer := serverPool.GetNextPeer("roundrobin")
+	if peer != nil {
+		peer.ReverseProxy.ServeHTTP(w, r)
+		return
+	}
+	http.Error(w, "Service not available", http.StatusServiceUnavailable)
+}
+
+func (b *Backend) IncreaseConn() {
+	b.countConn++
+}
+
+// redirect request to server is least connection
+func LeastConn(w http.ResponseWriter, r *http.Request) {
+	attempts := GetAttemptsFromContext(r)
+	if attempts > 3 {
+		log.Printf("%s(%s) Max attempts reached, terminating\n", r.RemoteAddr, r.URL.Path)
+		http.Error(w, "Service not available", http.StatusServiceUnavailable)
+		return
+	}
+	peer := serverPool.GetNextPeer("leastconn")
 	if peer != nil {
 		peer.ReverseProxy.ServeHTTP(w, r)
 		return
@@ -158,13 +197,14 @@ func main() {
 			log.Printf("%s(%s) Attempting retry %d\n", request.RemoteAddr, request.URL.Path, attempts)
 			ctx := context.WithValue(request.Context(), Attempts, attempts+1)
 			fmt.Println("hello")
-			RoundRobin(writer, request.WithContext(ctx))
+			LeastConn(writer, request.WithContext(ctx))
 		}
 
 		serverPool.AddBackend(&Backend{
 			URL:          serverUrl,
 			Alive:        true,
 			ReverseProxy: proxy,
+			countConn:    0,
 		})
 		log.Printf("Configured server: %s\n", serverUrl)
 	}
@@ -172,7 +212,7 @@ func main() {
 	// create http server
 	server := http.Server{
 		Addr:    fmt.Sprintf(":%d", port),
-		Handler: http.HandlerFunc(lb),
+		Handler: http.HandlerFunc(LeastConn),
 	}
 
 	// start health checking
